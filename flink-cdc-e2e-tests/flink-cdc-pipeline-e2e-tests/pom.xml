@@ -223,12 +223,12 @@ limitations under the License.
             <version>${project.version}</version>
             <scope>test</scope>
         </dependency>
-        <dependency>
+        <!--<dependency>
             <groupId>org.apache.flink</groupId>
             <artifactId>flink-cdc-pipeline-udf-examples</artifactId>
             <version>${project.version}</version>
             <scope>test</scope>
-        </dependency>
+        </dependency>  -->
 
         <!-- testcontainers -->
         <dependency>
@@ -778,7 +778,7 @@ limitations under the License.
                             </outputDirectory>
                         </artifactItem>
 
-                        <artifactItem>
+                        <!--<artifactItem>
                             <groupId>org.apache.flink</groupId>
                             <artifactId>flink-cdc-pipeline-udf-examples</artifactId>
                             <version>${project.version}</version>
@@ -786,7 +786,7 @@ limitations under the License.
                             <type>jar</type>
                             <outputDirectory>${project.build.directory}/dependencies
                             </outputDirectory>
-                        </artifactItem>
+                        </artifactItem>  -->
 
                         <artifactItem>
                             <groupId>org.scala-lang</groupId>
