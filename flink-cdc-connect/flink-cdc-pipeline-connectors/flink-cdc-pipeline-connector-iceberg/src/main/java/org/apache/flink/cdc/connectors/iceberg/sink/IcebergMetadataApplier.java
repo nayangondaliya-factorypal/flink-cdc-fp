@@ -97,6 +97,8 @@ public class IcebergMetadataApplier implements MetadataApplier {
 
     private Set<SchemaChangeEventType> enabledSchemaEvolutionTypes;
 
+    private final SchemaReconcileBehavior reconcileBehavior;
+
     public IcebergMetadataApplier(Map<String, String> catalogOptions) {
         this(catalogOptions, new HashMap<>(), new HashMap<>(), null);
     }
@@ -113,11 +115,27 @@ public class IcebergMetadataApplier implements MetadataApplier {
             Map<String, String> tableOptions,
             Map<TableId, List<String>> partitionMaps,
             Map<String, String> hadoopConfOptions) {
+        this(
+                catalogOptions,
+                tableOptions,
+                partitionMaps,
+                hadoopConfOptions,
+                SchemaReconcileBehavior.ADDITIVE);
+    }
+
+    public IcebergMetadataApplier(
+            Map<String, String> catalogOptions,
+            Map<String, String> tableOptions,
+            Map<TableId, List<String>> partitionMaps,
+            Map<String, String> hadoopConfOptions,
+            SchemaReconcileBehavior reconcileBehavior) {
         this.catalogOptions = catalogOptions;
         this.tableOptions = tableOptions;
         this.partitionMaps = partitionMaps;
         this.hadoopConfOptions = hadoopConfOptions;
         this.enabledSchemaEvolutionTypes = getSupportedSchemaEvolutionTypes();
+        this.reconcileBehavior =
+                reconcileBehavior == null ? SchemaReconcileBehavior.ADDITIVE : reconcileBehavior;
     }
 
     @Override
@@ -206,9 +224,208 @@ public class IcebergMetadataApplier implements MetadataApplier {
                         "Spend {} ms to create iceberg table {}",
                         System.currentTimeMillis() - startTimestamp,
                         tableIdentifier);
+            } else {
+                // Table already exists in the catalog. Its persisted schema may diverge from
+                // the incoming pipeline schema (e.g. the table was created by a previous run
+                // with different projection/aliases, the user deliberately kept extra
+                // columns, or upstream DDL occurred while this job was not running).
+                //
+                // How we react depends on reconcileBehavior:
+                //  - OFF:      leave the Iceberg schema untouched. The writer will still
+                //              project incoming records onto the persisted layout so a
+                //              mismatch does not blow up positional RowData access.
+                //  - ADDITIVE: add missing columns and alter primitive types if allowed;
+                //              never drop or reorder. Extra Iceberg columns are preserved
+                //              and the writer pads them with NULL.
+                //  - STRICT:   force the Iceberg schema to match CDC exactly (add/drop/
+                //              alter/reorder). May remove columns kept on purpose.
+                Table table = catalog.loadTable(tableIdentifier);
+                if (reconcileBehavior == SchemaReconcileBehavior.OFF) {
+                    LOG.info(
+                            "Iceberg table {} already exists and "
+                                    + "sink.schema.reconcile-on-create.behavior=off; leaving schema untouched.",
+                            tableIdentifier);
+                } else {
+                    reconcileExistingTable(table, cdcSchema, event.tableId());
+                    applyDefaultValues(table, cdcSchema);
+                }
+
+                LOG.info(
+                        "Spend {} ms to reconcile existing iceberg table {} (behavior={})",
+                        System.currentTimeMillis() - startTimestamp,
+                        tableIdentifier,
+                        reconcileBehavior);
             }
         } catch (Exception e) {
             throw new SchemaEvolveException(event, e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Aligns the persisted Iceberg table schema with the incoming CDC schema. Behavior depends on
+     * {@link #reconcileBehavior}:
+     *
+     * <ul>
+     *   <li>{@link SchemaReconcileBehavior#ADDITIVE} (default) - add missing CDC columns and alter
+     *       primitive-type mismatches (both gated on {@link #enabledSchemaEvolutionTypes}). Never
+     *       drop Iceberg-only columns, never reorder; the sink writer pads Iceberg-only columns
+     *       with NULL instead. Safe for tables that intentionally keep extra columns.
+     *   <li>{@link SchemaReconcileBehavior#STRICT} - in addition to the above, also drop columns
+     *       absent from the CDC schema and reorder columns to match the CDC order. This can delete
+     *       deliberately-retained columns.
+     * </ul>
+     *
+     * <p>{@link SchemaReconcileBehavior#OFF} never enters this method; callers short-circuit
+     * before it is invoked.
+     */
+    private void reconcileExistingTable(
+            Table table,
+            org.apache.flink.cdc.common.schema.Schema cdcSchema,
+            TableId tableId) {
+        Schema currentIcebergSchema = table.schema();
+        List<Column> cdcColumns = cdcSchema.getColumns();
+
+        Set<String> cdcColumnNames = new HashSet<>();
+        for (Column column : cdcColumns) {
+            cdcColumnNames.add(column.getName());
+        }
+
+        Set<String> icebergColumnNames = new HashSet<>();
+        for (Types.NestedField field : currentIcebergSchema.columns()) {
+            icebergColumnNames.add(field.name());
+        }
+
+        UpdateSchema updateSchema = table.updateSchema();
+        boolean hasChanges = false;
+
+        boolean canAdd = enabledSchemaEvolutionTypes.contains(SchemaChangeEventType.ADD_COLUMN);
+        boolean canDrop = enabledSchemaEvolutionTypes.contains(SchemaChangeEventType.DROP_COLUMN);
+        boolean canAlter =
+                enabledSchemaEvolutionTypes.contains(SchemaChangeEventType.ALTER_COLUMN_TYPE);
+        boolean dropExtras = reconcileBehavior == SchemaReconcileBehavior.STRICT && canDrop;
+        boolean reorder = reconcileBehavior == SchemaReconcileBehavior.STRICT;
+
+        // Extra Iceberg columns: drop only in STRICT+DROP_COLUMN. Otherwise preserve and log.
+        for (String icebergColumn : icebergColumnNames) {
+            if (cdcColumnNames.contains(icebergColumn)) {
+                continue;
+            }
+            if (dropExtras) {
+                LOG.info(
+                        "Dropping Iceberg column '{}' for table {} (strict mode) because it is not "
+                                + "present in the incoming CDC schema.",
+                        icebergColumn,
+                        tableId);
+                updateSchema.deleteColumn(icebergColumn);
+                hasChanges = true;
+            } else {
+                LOG.info(
+                        "Iceberg column '{}' for table {} is not present in the incoming CDC schema; "
+                                + "preserving it (behavior={}, DROP_COLUMN enabled={}). The sink writer "
+                                + "will emit NULL for this column.",
+                        icebergColumn,
+                        tableId,
+                        reconcileBehavior,
+                        canDrop);
+            }
+        }
+
+        // Add missing CDC columns; alter primitive type mismatches when allowed.
+        for (Column cdcColumn : cdcColumns) {
+            Types.NestedField existing = currentIcebergSchema.findField(cdcColumn.getName());
+            Type newIcebergType =
+                    FlinkSchemaUtil.convert(
+                            DataTypeUtils.toFlinkDataType(cdcColumn.getType()).getLogicalType());
+
+            if (existing == null) {
+                if (!canAdd) {
+                    LOG.warn(
+                            "CDC column '{}' is missing from Iceberg table {} but ADD_COLUMN is "
+                                    + "disabled. The sink writer will drop this column from written rows.",
+                            cdcColumn.getName(),
+                            tableId);
+                    continue;
+                }
+                LOG.info(
+                        "Adding missing Iceberg column '{}' (type {}) for table {}.",
+                        cdcColumn.getName(),
+                        newIcebergType,
+                        tableId);
+                updateSchema.addColumn(
+                        cdcColumn.getName(), newIcebergType, cdcColumn.getComment());
+                hasChanges = true;
+            } else if (!existing.type().equals(newIcebergType)) {
+                if (!canAlter) {
+                    LOG.warn(
+                            "Iceberg column '{}' for table {} has type {} but CDC schema expects {}; "
+                                    + "ALTER_COLUMN_TYPE is disabled so leaving as-is.",
+                            cdcColumn.getName(),
+                            tableId,
+                            existing.type(),
+                            newIcebergType);
+                    continue;
+                }
+                if (!newIcebergType.isPrimitiveType()) {
+                    LOG.warn(
+                            "Cannot reconcile Iceberg column '{}' for table {}: Iceberg only "
+                                    + "supports altering primitive column types, but incoming type is {}.",
+                            cdcColumn.getName(),
+                            tableId,
+                            newIcebergType);
+                    continue;
+                }
+                try {
+                    updateSchema.updateColumn(
+                            cdcColumn.getName(), newIcebergType.asPrimitiveType());
+                    hasChanges = true;
+                    LOG.info(
+                            "Altering Iceberg column '{}' for table {} from {} to {}.",
+                            cdcColumn.getName(),
+                            tableId,
+                            existing.type(),
+                            newIcebergType);
+                } catch (IllegalArgumentException e) {
+                    // Iceberg disallows certain promotions (e.g. int->string). Skip and warn.
+                    LOG.warn(
+                            "Iceberg rejected altering column '{}' for table {} from {} to {}: {}",
+                            cdcColumn.getName(),
+                            tableId,
+                            existing.type(),
+                            newIcebergType,
+                            e.getMessage());
+                }
+            }
+        }
+
+        // Reorder to the CDC layout only in STRICT. In ADDITIVE, the writer's projection layer
+        // handles positional mismatches without touching Iceberg metadata.
+        if (reorder) {
+            for (int i = 0; i < cdcColumns.size(); i++) {
+                String columnName = cdcColumns.get(i).getName();
+                if (!cdcColumnNames.contains(columnName)) {
+                    continue;
+                }
+                if (i == 0) {
+                    updateSchema.moveFirst(columnName);
+                } else {
+                    updateSchema.moveAfter(columnName, cdcColumns.get(i - 1).getName());
+                }
+            }
+            hasChanges = true;
+        }
+
+        if (hasChanges) {
+            updateSchema.commit();
+            LOG.info(
+                    "Reconciled Iceberg schema for table {} (behavior={}).",
+                    tableId,
+                    reconcileBehavior);
+        } else {
+            LOG.info(
+                    "Iceberg schema for table {} already covers the incoming CDC schema; "
+                            + "no reconciliation needed (behavior={}).",
+                    tableId,
+                    reconcileBehavior);
         }
     }
 
