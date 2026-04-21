@@ -281,4 +281,46 @@ public class PostgresDataSourceOptions {
                     .defaultValue(false)
                     .withDescription(
                             "Whether to infer CDC column types when processing pgoutput Relation messages.");
+
+    // ----------------------------------------------------------------------------
+    // Newly-added-table discovery options (ported from the MySQL pipeline connector,
+    // apache/flink-cdc PR #3560 / FLINK-36115). On Postgres these have two additional
+    // prerequisites that the MySQL equivalents do not:
+    //   1. The replication slot ({@link #SLOT_NAME}) MUST already have the new table
+    //      in scope, which for pgoutput means the publication must include it. Use
+    //      publication.autocreate.mode=all_tables (FOR ALL TABLES) or run
+    //      `ALTER PUBLICATION ... ADD TABLE` before inserting into the new table,
+    //      otherwise the WAL carries no changes for it.
+    //   2. Only one consumer per replication slot is allowed, so these options work
+    //      on the existing pipeline rather than by spinning up a second job.
+    // ----------------------------------------------------------------------------
+    @Experimental
+    public static final ConfigOption<Boolean> SCAN_NEWLY_ADDED_TABLE_ENABLED =
+            ConfigOptions.key("scan.newly-added-table.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to scan the newly added tables or not, by default is false. "
+                                    + "This option is only useful when we start the job from a "
+                                    + "savepoint/checkpoint: on restore the enumerator re-lists "
+                                    + "tables matching the 'tables' pattern, diffs against the "
+                                    + "saved state, and schedules snapshot splits for the newly "
+                                    + "discovered tables followed by WAL streaming.");
+
+    @Experimental
+    public static final ConfigOption<Boolean> SCAN_BINLOG_NEWLY_ADDED_TABLE_ENABLED =
+            ConfigOptions.key("scan.binlog.newly-added-table.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "In the WAL (streaming) reading stage, whether to scan DDL/DML of "
+                                    + "newly added tables or not. Default is false. Difference "
+                                    + "between this option and scan.newly-added-table.enabled: \n"
+                                    + "  scan.newly-added-table.enabled: snapshot + WAL for "
+                                    + "newly added tables, triggered by savepoint restore; \n"
+                                    + "  scan.binlog.newly-added-table.enabled: WAL-only for "
+                                    + "newly added tables during streaming phase, no snapshot "
+                                    + "and no restart required. Requires the Postgres publication "
+                                    + "to already include the new table (use "
+                                    + "publication.autocreate.mode=all_tables).");
 }
