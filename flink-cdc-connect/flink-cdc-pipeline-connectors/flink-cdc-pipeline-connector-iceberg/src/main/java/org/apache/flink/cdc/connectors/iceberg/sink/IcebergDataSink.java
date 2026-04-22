@@ -52,8 +52,6 @@ public class IcebergDataSink implements DataSink, Serializable {
 
     public final String jobIdPrefix;
 
-    private final SchemaReconcileBehavior reconcileBehavior;
-
     public IcebergDataSink(
             Map<String, String> catalogOptions,
             Map<String, String> tableOptions,
@@ -63,28 +61,6 @@ public class IcebergDataSink implements DataSink, Serializable {
             CompactionOptions compactionOptions,
             String jobIdPrefix,
             Map<String, String> hadoopConfOptions) {
-        this(
-                catalogOptions,
-                tableOptions,
-                partitionMaps,
-                zoneId,
-                schemaOperatorUid,
-                compactionOptions,
-                jobIdPrefix,
-                hadoopConfOptions,
-                SchemaReconcileBehavior.ADDITIVE);
-    }
-
-    public IcebergDataSink(
-            Map<String, String> catalogOptions,
-            Map<String, String> tableOptions,
-            Map<TableId, List<String>> partitionMaps,
-            ZoneId zoneId,
-            String schemaOperatorUid,
-            CompactionOptions compactionOptions,
-            String jobIdPrefix,
-            Map<String, String> hadoopConfOptions,
-            SchemaReconcileBehavior reconcileBehavior) {
         this.catalogOptions = catalogOptions;
         this.tableOptions = tableOptions;
         this.partitionMaps = partitionMaps;
@@ -93,7 +69,6 @@ public class IcebergDataSink implements DataSink, Serializable {
         this.compactionOptions = compactionOptions;
         this.jobIdPrefix = jobIdPrefix;
         this.hadoopConfOptions = hadoopConfOptions;
-        this.reconcileBehavior = reconcileBehavior;
     }
 
     @Override
@@ -112,11 +87,7 @@ public class IcebergDataSink implements DataSink, Serializable {
     @Override
     public MetadataApplier getMetadataApplier() {
         return new IcebergMetadataApplier(
-                catalogOptions,
-                tableOptions,
-                partitionMaps,
-                hadoopConfOptions,
-                reconcileBehavior);
+                catalogOptions, tableOptions, partitionMaps, hadoopConfOptions);
     }
 
     public Map<String, String> getHadoopConfOptions() {

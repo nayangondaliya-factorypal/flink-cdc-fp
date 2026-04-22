@@ -361,15 +361,8 @@ public class SchemaUtils {
                             return true;
                         },
                         createTableEvent -> {
-                            // A CreateTableEvent is only truly redundant when the table is
-                            // already known AND the carried schema matches the current one.
-                            // After savepoint restore, the source may re-emit a CreateTableEvent
-                            // whose schema has drifted from state (e.g. upstream DDL applied
-                            // while the job was stopped). Such an event must not be skipped
-                            // here; downstream logic is responsible for turning it into a
-                            // proper schema diff.
-                            return latestSchema.isPresent()
-                                    && latestSchema.get().equals(createTableEvent.getSchema());
+                            // It has been applied if such table already exists
+                            return latestSchema.isPresent();
                         },
                         dropColumnEvent -> {
                             // It has not been applied if schema does not even exist

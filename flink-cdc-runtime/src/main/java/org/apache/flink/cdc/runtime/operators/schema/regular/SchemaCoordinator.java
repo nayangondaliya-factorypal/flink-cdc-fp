@@ -371,36 +371,7 @@ public class SchemaCoordinator extends SchemaRegistry {
 
         // For redundant schema change events (possibly coming from duplicate emitted
         // CreateTableEvents in snapshot stage), we just skip them.
-        //
-        // Special case: a CreateTableEvent for an already-known table whose carried schema
-        // differs from the stored one is NOT a duplicate. This typically happens after
-        // restoring from a savepoint when upstream DDL (column rename / type change / add /
-        // drop) was applied while the job was stopped. Instead of skipping the event, we
-        // translate it into the minimal set of AddColumn / AlterColumnType / DropColumn
-        // events via SchemaMergingUtils.getSchemaDifference and apply those. This keeps the
-        // internal schema registry and downstream operators in sync with the live upstream
-        // schema.
-        if (originalEvent instanceof CreateTableEvent
-                && currentUpstreamSchema != null
-                && !currentUpstreamSchema.equals(((CreateTableEvent) originalEvent).getSchema())) {
-            Schema newUpstreamSchema = ((CreateTableEvent) originalEvent).getSchema();
-            List<SchemaChangeEvent> schemaDiffEvents =
-                    SchemaMergingUtils.getSchemaDifference(
-                            originalTableId, currentUpstreamSchema, newUpstreamSchema);
-            LOG.info(
-                    "Detected schema drift on CreateTableEvent for table {}. "
-                            + "Current schema: {}, incoming schema: {}. "
-                            + "Translated into diff events: {}",
-                    originalTableId,
-                    currentUpstreamSchema,
-                    newUpstreamSchema,
-                    schemaDiffEvents);
-            for (SchemaChangeEvent diffEvent : schemaDiffEvents) {
-                schemaManager.applyOriginalSchemaChange(diffEvent);
-                deducedSchemaChangeEvents.addAll(deduceEvolvedSchemaChanges(diffEvent));
-            }
-        } else if (!SchemaUtils.isSchemaChangeEventRedundant(
-                currentUpstreamSchema, originalEvent)) {
+        if (!SchemaUtils.isSchemaChangeEventRedundant(currentUpstreamSchema, originalEvent)) {
             schemaManager.applyOriginalSchemaChange(originalEvent);
             deducedSchemaChangeEvents.addAll(deduceEvolvedSchemaChanges(originalEvent));
         } else {

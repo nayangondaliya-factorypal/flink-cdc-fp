@@ -45,9 +45,6 @@ import org.apache.flink.streaming.api.operators.Output;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.tasks.StreamTask;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import javax.annotation.Nullable;
 
 import java.io.Serializable;
@@ -67,7 +64,6 @@ public class PreTransformOperator extends AbstractStreamOperatorAdapter<Event>
         implements OneInputStreamOperator<Event, Event>, Serializable {
 
     private static final long serialVersionUID = 1L;
-    private static final Logger LOG = LoggerFactory.getLogger(PreTransformOperator.class);
 
     private final List<TransformRule> transformRules;
     private final Map<TableId, PreTransformChangeInfo> preTransformChangeInfoMap;
@@ -199,22 +195,7 @@ public class PreTransformOperator extends AbstractStreamOperatorAdapter<Event>
             CreateTableEvent createTableEvent = (CreateTableEvent) event;
             // CreateTableEvent from Source Contains the latest schema,
             // which may be different with the schema currently being processed.
-            TableId tableId = createTableEvent.tableId();
-            PreTransformChangeInfo cached = preTransformChangeInfoMap.get(tableId);
-            if (cached == null) {
-                output.collect(new StreamRecord<>(cacheCreateTable(createTableEvent)));
-            } else if (!cached.getSourceSchema().equals(createTableEvent.getSchema())) {
-                // Upstream schema has drifted from what this operator cached - typically after
-                // restoring from a savepoint with DDL applied while the job was stopped.
-                // Rebuild the processor and its BinaryRecordDataGenerator against the new
-                // schema so subsequent DataChangeEvents serialize with correct field metadata
-                // and forward the refreshed CreateTableEvent downstream.
-                LOG.info(
-                        "PreTransformOperator detected schema drift for table {}. "
-                                + "Cached schema: {}, incoming schema: {}. Rebuilding processor.",
-                        tableId,
-                        cached.getSourceSchema(),
-                        createTableEvent.getSchema());
+            if (!preTransformProcessorMap.containsKey(createTableEvent.tableId())) {
                 output.collect(new StreamRecord<>(cacheCreateTable(createTableEvent)));
             }
         } else if (event instanceof DropTableEvent) {

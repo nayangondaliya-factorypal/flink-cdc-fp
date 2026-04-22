@@ -112,13 +112,6 @@ public class IcebergDataSinkFactory implements DataSinkFactory {
         String jobIdPrefix =
                 context.getFactoryConfiguration().get(IcebergDataSinkOptions.JOB_ID_PREFIX);
 
-        SchemaReconcileBehavior reconcileBehavior =
-                SchemaReconcileBehavior.from(
-                        context.getFactoryConfiguration()
-                                .get(
-                                        IcebergDataSinkOptions
-                                                .SINK_SCHEMA_RECONCILE_ON_CREATE_BEHAVIOR));
-
         return new IcebergDataSink(
                 catalogOptions,
                 tableOptions,
@@ -127,8 +120,7 @@ public class IcebergDataSinkFactory implements DataSinkFactory {
                 schemaOperatorUid,
                 compactionOptions,
                 jobIdPrefix,
-                hadoopConfOptions,
-                reconcileBehavior);
+                hadoopConfOptions);
     }
 
     static Map<String, String> extractHadoopConfOptions(Map<String, String> allOptions) {
@@ -177,7 +169,6 @@ public class IcebergDataSinkFactory implements DataSinkFactory {
         options.add(IcebergDataSinkOptions.SINK_COMPACTION_COMMIT_INTERVAL);
         options.add(IcebergDataSinkOptions.SINK_COMPACTION_PARALLELISM);
         options.add(IcebergDataSinkOptions.JOB_ID_PREFIX);
-        options.add(IcebergDataSinkOptions.SINK_SCHEMA_RECONCILE_ON_CREATE_BEHAVIOR);
         return options;
     }
 }

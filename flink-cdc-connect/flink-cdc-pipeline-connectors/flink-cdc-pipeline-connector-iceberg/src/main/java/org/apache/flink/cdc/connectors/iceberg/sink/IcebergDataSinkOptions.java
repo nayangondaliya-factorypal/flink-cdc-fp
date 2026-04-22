@@ -135,24 +135,4 @@ public class IcebergDataSinkOptions {
                     .defaultValue("cdc")
                     .withDescription(
                             "The prefix of job id, which is used to distinguish different jobs.");
-
-    @Experimental
-    public static final ConfigOption<String> SINK_SCHEMA_RECONCILE_ON_CREATE_BEHAVIOR =
-            key("sink.schema.reconcile-on-create.behavior")
-                    .stringType()
-                    .defaultValue("additive")
-                    .withDescription(
-                            "Controls how the Iceberg sink reacts to a CreateTableEvent for a table "
-                                    + "that already exists in the catalog but whose persisted schema "
-                                    + "differs from the incoming pipeline schema. Allowed values: "
-                                    + "`off` (never touch the existing table; the writer will still "
-                                    + "project incoming records onto the persisted Iceberg layout to "
-                                    + "avoid index-out-of-bounds failures), "
-                                    + "`additive` (default; add missing columns and, if allowed, alter "
-                                    + "primitive type mismatches; never drop or reorder; extra Iceberg "
-                                    + "columns are preserved and the writer pads them with NULL for "
-                                    + "pipeline-generated rows), "
-                                    + "`strict` (add, drop, alter, and reorder so the existing Iceberg "
-                                    + "schema exactly matches the pipeline schema \u2014 may drop "
-                                    + "deliberately-retained stale columns).");
 }
