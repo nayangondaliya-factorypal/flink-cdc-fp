@@ -53,7 +53,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import static org.apache.flink.cdc.common.route.TableIdRouter.convertTableListToRegExpPattern;
 import static org.apache.flink.cdc.connectors.base.utils.ObjectUtils.doubleCompare;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CHUNK_KEY_EVEN_DISTRIBUTION_FACTOR_LOWER_BOUND;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.CHUNK_KEY_EVEN_DISTRIBUTION_FACTOR_UPPER_BOUND;
@@ -67,7 +66,6 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.METADATA_LIST;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PASSWORD;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.PG_PORT;
-import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_BINLOG_NEWLY_ADDED_TABLE_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_CLOSE_IDLE_READER_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_BACKFILL_SKIP;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_KEY_COLUMN;
@@ -137,33 +135,6 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         boolean tableIdIncludeDatabase = config.get(TABLE_ID_INCLUDE_DATABASE);
         boolean includeSchemaChanges = config.get(SCHEMA_CHANGE_ENABLED);
         boolean scanNewlyAddedTableEnabled = config.get(SCAN_NEWLY_ADDED_TABLE_ENABLED);
-        boolean scanBinlogNewlyAddedTableEnabled = config.get(SCAN_BINLOG_NEWLY_ADDED_TABLE_ENABLED);
-
-        // The two modes trigger two different recovery paths in cdc-base's
-        // SnapshotSplitAssigner / IncrementalSourceEnumerator; enabling both would
-        // make newly-added tables be both snapshotted (on restore) and streamed from
-        // WAL (while running), producing duplicates. See MySqlDataSourceFactory for
-        // the same check.
-        if (scanBinlogNewlyAddedTableEnabled && scanNewlyAddedTableEnabled) {
-            throw new IllegalArgumentException(
-                    "Options 'scan.binlog.newly-added-table.enabled' and "
-                            + "'scan.newly-added-table.enabled' cannot both be true: "
-                            + "enabling both would cause duplicate records for newly "
-                            + "added tables after a savepoint restore.");
-        }
-
-        // tables.exclude in scan.binlog.newly-added-table.enabled mode would require
-        // pushing an exclude regex into Debezium's table.exclude.list. The Postgres
-        // PostgresSourceConfigFactory does not expose an excludeTableList() setter
-        // (unlike MySQL), so we reject this combination explicitly rather than
-        // silently ignoring tables.exclude.
-        if (scanBinlogNewlyAddedTableEnabled && tablesExclude != null) {
-            throw new IllegalArgumentException(
-                    "Option 'tables.exclude' is not supported when "
-                            + "'scan.binlog.newly-added-table.enabled' is true on the "
-                            + "Postgres pipeline connector. Use a more restrictive "
-                            + "'tables' pattern instead.");
-        }
 
         validateIntegerOption(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE, splitSize, 1);
         validateIntegerOption(CHUNK_META_GROUP_SIZE, splitMetaGroupSize, 1);
@@ -209,48 +180,35 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .scanNewlyAddedTableEnabled(scanNewlyAddedTableEnabled)
                         .getConfigFactory();
 
-        if (scanBinlogNewlyAddedTableEnabled) {
-            // WAL-only mode for newly added tables: hand Debezium a RegExp pattern
-            // so table.include.list matches future tables too. The initial snapshot
-            // still covers whichever tables match the regex at job submit time;
-            // tables that appear later during streaming are picked up directly from
-            // the WAL (no snapshot). See PostgresPipelineRecordEmitter's
-            // handleDataChangeRecord fallback which issues a fresh CreateTableEvent
-            // via JDBC when it sees a WAL record for an uncached table.
-            String newTables = convertTableListToRegExpPattern(tables);
-            configFactory.tableList(newTables);
-        } else {
-            // Concrete mode: resolve the regex against current tables and freeze
-            // the list. With scan.newly-added-table.enabled=true this is still the
-            // right shape — cdc-base's SnapshotSplitAssigner.captureNewlyAddedTables
-            // re-discovers tables on enumerator re-open (i.e. savepoint restore) by
-            // calling dialect.discoverDataCollections using the same filter, so the
-            // user restarts the job (with updated 'tables' pattern if needed) and
-            // new tables get a snapshot split followed by WAL streaming.
-            List<TableId> tableIds =
-                    PostgresSchemaUtils.listTables(configFactory.create(0), null);
+        // Resolve the 'tables' regex against current tables and freeze the list.
+        // With scan.newly-added-table.enabled=true this is still the right shape —
+        // cdc-base's SnapshotSplitAssigner.captureNewlyAddedTables re-discovers
+        // tables on enumerator re-open (i.e. savepoint restore) by calling
+        // dialect.discoverDataCollections using the same filter, so the user
+        // restarts the job (with an updated 'tables' pattern if needed) and new
+        // tables get a snapshot split followed by WAL streaming.
+        List<TableId> tableIds = PostgresSchemaUtils.listTables(configFactory.create(0), null);
 
-            Selectors selectors = new Selectors.SelectorsBuilder().includeTables(tables).build();
-            List<String> capturedTables = getTableList(tableIds, selectors);
+        Selectors selectors = new Selectors.SelectorsBuilder().includeTables(tables).build();
+        List<String> capturedTables = getTableList(tableIds, selectors);
+        if (capturedTables.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "Cannot find any table by the option 'tables' = " + tables);
+        }
+        if (tablesExclude != null) {
+            Selectors selectExclude =
+                    new Selectors.SelectorsBuilder().includeTables(tablesExclude).build();
+            List<String> excludeTables = getTableList(tableIds, selectExclude);
+            if (!excludeTables.isEmpty()) {
+                capturedTables.removeAll(excludeTables);
+            }
             if (capturedTables.isEmpty()) {
                 throw new IllegalArgumentException(
-                        "Cannot find any table by the option 'tables' = " + tables);
+                        "Cannot find any table with by the option 'tables.exclude'  = "
+                                + tablesExclude);
             }
-            if (tablesExclude != null) {
-                Selectors selectExclude =
-                        new Selectors.SelectorsBuilder().includeTables(tablesExclude).build();
-                List<String> excludeTables = getTableList(tableIds, selectExclude);
-                if (!excludeTables.isEmpty()) {
-                    capturedTables.removeAll(excludeTables);
-                }
-                if (capturedTables.isEmpty()) {
-                    throw new IllegalArgumentException(
-                            "Cannot find any table with by the option 'tables.exclude'  = "
-                                    + tablesExclude);
-                }
-            }
-            configFactory.tableList(capturedTables.toArray(new String[0]));
         }
+        configFactory.tableList(capturedTables.toArray(new String[0]));
 
         String metadataList = config.get(METADATA_LIST);
         List<PostgreSQLReadableMetadata> readableMetadataList = listReadableMetadata(metadataList);
@@ -319,7 +277,6 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         options.add(TABLE_ID_INCLUDE_DATABASE);
         options.add(SCHEMA_CHANGE_ENABLED);
         options.add(SCAN_NEWLY_ADDED_TABLE_ENABLED);
-        options.add(SCAN_BINLOG_NEWLY_ADDED_TABLE_ENABLED);
         return options;
     }
 
