@@ -125,8 +125,17 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                 Table table = tableChange.getTable();
                 CreateTableEvent createTableEvent =
                         toCreateTableEvent(table, sourceConfig, postgresDialect);
-                ((DebeziumEventDeserializationSchema) debeziumDeserializationSchema)
-                        .applyChangeEvent(createTableEvent);
+                // Key the cache by the original Debezium TableId (catalog=null,
+                // schema, table) so it matches every lookup path in this emitter
+                // (handleDataChangeRecord#getTableId, handleSchemaChangeRecord via
+                // PostgresSchemaRecord#getTable().id(), and the snapshot
+                // low-watermark branch). DebeziumEventDeserializationSchema#applyChangeEvent
+                // would instead key by (database, schema, table) when
+                // table-id.include-database=true, making the entry unreachable
+                // and forcing a DB re-query on first DML — and breaking schema
+                // evolution entirely when the first event for the table after
+                // savepoint restore is a Relation message rather than a DML row.
+                createTableEventCache.put(table.id(), createTableEvent);
                 initiallyKnownTables.add(table.id());
             }
         }
