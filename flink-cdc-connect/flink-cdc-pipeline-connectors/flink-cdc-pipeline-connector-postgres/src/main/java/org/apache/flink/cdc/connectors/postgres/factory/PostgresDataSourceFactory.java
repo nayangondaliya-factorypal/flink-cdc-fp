@@ -72,6 +72,7 @@ import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSource
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_LSN_COMMIT_CHECKPOINTS_DELAY;
+import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_NEWLY_ADDED_TABLE_ENABLED;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_SNAPSHOT_FETCH_SIZE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCAN_STARTUP_MODE;
 import static org.apache.flink.cdc.connectors.postgres.source.PostgresDataSourceOptions.SCHEMA_CHANGE_ENABLED;
@@ -133,6 +134,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         int lsnCommitCheckpointsDelay = config.get(SCAN_LSN_COMMIT_CHECKPOINTS_DELAY);
         boolean tableIdIncludeDatabase = config.get(TABLE_ID_INCLUDE_DATABASE);
         boolean includeSchemaChanges = config.get(SCHEMA_CHANGE_ENABLED);
+        boolean scanNewlyAddedTableEnabled = config.get(SCAN_NEWLY_ADDED_TABLE_ENABLED);
 
         validateIntegerOption(SCAN_INCREMENTAL_SNAPSHOT_CHUNK_SIZE, splitSize, 1);
         validateIntegerOption(CHUNK_META_GROUP_SIZE, splitMetaGroupSize, 1);
@@ -175,8 +177,16 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
                         .assignUnboundedChunkFirst(isAssignUnboundedChunkFirst)
                         .includeDatabaseInTableId(tableIdIncludeDatabase)
                         .includeSchemaChanges(includeSchemaChanges)
+                        .scanNewlyAddedTableEnabled(scanNewlyAddedTableEnabled)
                         .getConfigFactory();
 
+        // Resolve the 'tables' regex against current tables and freeze the list.
+        // With scan.newly-added-table.enabled=true this is still the right shape —
+        // cdc-base's SnapshotSplitAssigner.captureNewlyAddedTables re-discovers
+        // tables on enumerator re-open (i.e. savepoint restore) by calling
+        // dialect.discoverDataCollections using the same filter, so the user
+        // restarts the job (with an updated 'tables' pattern if needed) and new
+        // tables get a snapshot split followed by WAL streaming.
         List<TableId> tableIds = PostgresSchemaUtils.listTables(configFactory.create(0), null);
 
         Selectors selectors = new Selectors.SelectorsBuilder().includeTables(tables).build();
@@ -266,6 +276,7 @@ public class PostgresDataSourceFactory implements DataSourceFactory {
         options.add(SCAN_INCREMENTAL_SNAPSHOT_UNBOUNDED_CHUNK_FIRST_ENABLED);
         options.add(TABLE_ID_INCLUDE_DATABASE);
         options.add(SCHEMA_CHANGE_ENABLED);
+        options.add(SCAN_NEWLY_ADDED_TABLE_ENABLED);
         return options;
     }
 

@@ -78,6 +78,12 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
     // Used when startup mode is not initial
     private boolean shouldEmitAllCreateTableEventsInSnapshotMode = true;
 
+    // Tables present in the captured set when the (re-)started fetch task began.
+    // When scan.newly-added-table.enabled=false, only records for these tables
+    // are forwarded; records (DML or Relation) for any other table are dropped.
+    private final Set<TableId> initiallyKnownTables = new HashSet<>();
+    private final boolean scanNewlyAddedTableEnabled;
+
     public PostgresPipelineRecordEmitter(
             DebeziumDeserializationSchema<T> debeziumDeserializationSchema,
             SourceReaderMetrics sourceReaderMetrics,
@@ -98,13 +104,19 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                         .getCreateTableEventCache();
         generateCreateTableEvent(sourceConfig);
         this.isBounded = StartupOptions.snapshot().equals(sourceConfig.getStartupOptions());
+        this.scanNewlyAddedTableEnabled = sourceConfig.isScanNewlyAddedTableEnabled();
+        LOG.info(
+                "PostgresPipelineRecordEmitter initialized: scanNewlyAddedTableEnabled={}",
+                scanNewlyAddedTableEnabled);
     }
 
     @Override
     public void applySplit(SourceSplitBase split) {
         if ((isBounded) && createTableEventCache.isEmpty() && split instanceof SnapshotSplit) {
             // TableSchemas in SnapshotSplit only contains one table.
-            createTableEventCache.putAll(generateCreateTableEvent(sourceConfig));
+            Map<TableId, CreateTableEvent> generated = generateCreateTableEvent(sourceConfig);
+            createTableEventCache.putAll(generated);
+            initiallyKnownTables.addAll(generated.keySet());
         } else {
             for (Map.Entry<TableId, TableChanges.TableChange> entry :
                     split.getTableSchemas().entrySet()) {
@@ -113,16 +125,49 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
                 Table table = tableChange.getTable();
                 CreateTableEvent createTableEvent =
                         toCreateTableEvent(table, sourceConfig, postgresDialect);
-                ((DebeziumEventDeserializationSchema) debeziumDeserializationSchema)
-                        .applyChangeEvent(createTableEvent);
+                // Key the cache by the original Debezium TableId (catalog=null,
+                // schema, table) so it matches every lookup path in this emitter
+                // (handleDataChangeRecord#getTableId, handleSchemaChangeRecord via
+                // PostgresSchemaRecord#getTable().id(), and the snapshot
+                // low-watermark branch). DebeziumEventDeserializationSchema#applyChangeEvent
+                // would instead key by (database, schema, table) when
+                // table-id.include-database=true, making the entry unreachable
+                // and forcing a DB re-query on first DML — and breaking schema
+                // evolution entirely when the first event for the table after
+                // savepoint restore is a Relation message rather than a DML row.
+                createTableEventCache.put(table.id(), createTableEvent);
+                initiallyKnownTables.add(table.id());
             }
         }
+        LOG.info(
+                "applySplit: {} ({}). initiallyKnownTables now has {} table(s): {}",
+                split.splitId(),
+                split.getClass().getSimpleName(),
+                initiallyKnownTables.size(),
+                initiallyKnownTables);
     }
 
     @Override
     protected void processElement(
             SourceRecord element, SourceOutput<T> output, SourceSplitState splitState)
             throws Exception {
+        // Honor scan.newly-added-table.enabled at streaming time. The base
+        // IncrementalSourceStreamFetcher.hasEnterPureStreamPhase intentionally
+        // forwards records for new tables that match the include-filter when
+        // scan.newly-added-table.enabled=false (to support MySQL sharding).
+        // PostgreSQL has no sharding semantics here, so we must filter out
+        // records for tables that were not in the captured set at (re-)start.
+        if (!scanNewlyAddedTableEnabled) {
+            TableId tableId = extractTableId(element);
+            if (tableId != null && !initiallyKnownTables.contains(tableId)) {
+                LOG.info(
+                        "Suppressing record for newly added table {} "
+                                + "(scan.newly-added-table.enabled=false). Element class={}",
+                        tableId,
+                        element.getClass().getSimpleName());
+                return;
+            }
+        }
         if (shouldEmitAllCreateTableEventsInSnapshotMode && isBounded) {
             // In snapshot mode, we simply emit all schemas at once.
             createTableEventCache.forEach(
@@ -139,6 +184,22 @@ public class PostgresPipelineRecordEmitter<T> extends PostgresSourceRecordEmitte
             handleSchemaChangeRecord(element, output, splitState);
         }
         super.processElement(element, output, splitState);
+    }
+
+    /**
+     * Returns the {@link TableId} associated with the given source record, or {@code null} if the
+     * record carries no table identity (e.g. watermark / heartbeat events). Used by the
+     * scan.newly-added-table.enabled=false gate to decide whether the element should be
+     * suppressed.
+     */
+    private TableId extractTableId(SourceRecord element) {
+        if (element instanceof PostgresSchemaRecord) {
+            return ((PostgresSchemaRecord) element).getTable().id();
+        }
+        if (isDataChangeRecord(element)) {
+            return getTableId(element);
+        }
+        return null;
     }
 
     private void handleDataChangeRecord(SourceRecord element, SourceOutput<T> output) {
